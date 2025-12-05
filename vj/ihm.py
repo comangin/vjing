@@ -5,12 +5,21 @@ le blocksize, la fréquence d'échantillonnage, etc. Retourne un dict de config.
 """
 import os
 from typing import Optional
+import queue
+import threading
+import math
+import time
 
 try:
     import tkinter as tk
     from tkinter import filedialog, simpledialog, messagebox, colorchooser
 except ImportError:
     tk = None
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 
 def select_config(devices, default_blocksize=1024, default_samplerate=None):
     """Affiche une IHM tkinter pour choisir les paramètres. Retourne un dict."""
@@ -41,6 +50,113 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
     dev_names = [f"{i}: {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']})" for i, d in enumerate(devices)]
     dev_menu = tk.OptionMenu(root, dev_var, 'default', *dev_names)
     dev_menu.pack(anchor='w', padx=10)
+    
+    # Small live level meter (shows input level for the selected device)
+    meter_frame = tk.Frame(root)
+    meter_frame.pack(anchor='w', padx=10, pady=(8,0))
+    tk.Label(meter_frame, text='Niveau (entrée):').pack(side='left')
+    meter_canvas = tk.Canvas(meter_frame, width=220, height=20, bg='#222222', highlightthickness=0)
+    meter_canvas.pack(side='left', padx=(8,0))
+    meter_bar = meter_canvas.create_rectangle(0, 0, 0, 20, fill='#2ecc40', width=0)
+    meter_text = tk.Label(meter_frame, text='—', width=6)
+    meter_text.pack(side='left', padx=(8,0))
+
+    # meter internals
+    meter_q = queue.Queue()
+    meter_stream = {'obj': None}
+    meter_after_id = {'id': None}
+
+    def audio_callback(indata, frames, time_info, status):
+        # compute RMS of first channel, push to queue
+        try:
+            # prefer numpy if available for speed
+            import numpy as _np
+            data = _np.asarray(indata[:, 0], dtype=_np.float32)
+            rms = float(_np.sqrt((_np.square(data)).mean()))
+        except Exception:
+            try:
+                # fallback: Python loop
+                arr = [float(x[0]) for x in indata]
+                s = 0.0
+                for v in arr:
+                    s += v * v
+                rms = math.sqrt(s / max(1, len(arr)))
+            except Exception:
+                return
+        try:
+            # keep only the latest value
+            while not meter_q.empty():
+                meter_q.get_nowait()
+            meter_q.put_nowait(rms)
+        except Exception:
+            pass
+
+    def start_meter_for_device(dev_idx):
+        # stop existing
+        stop_meter()
+        if sd is None:
+            meter_text.config(text='no sounddevice')
+            return
+        try:
+            device = None if dev_idx is None else int(dev_idx)
+            # choose 1 channel for meter; let sounddevice pick samplerate
+            stream = sd.InputStream(device=device, channels=1, callback=audio_callback)
+            stream.start()
+            meter_stream['obj'] = stream
+            meter_text.config(text='0.00')
+        except Exception as e:
+            meter_text.config(text='err')
+            meter_stream['obj'] = None
+
+    def stop_meter():
+        s = meter_stream.get('obj')
+        if s is not None:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
+        meter_stream['obj'] = None
+        # cancel after callback if scheduled
+        aid = meter_after_id.get('id')
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+            meter_after_id['id'] = None
+
+    def update_meter():
+        # poll queue for latest rms
+        try:
+                val = None
+                while True:
+                    val = meter_q.get_nowait()
+        except Exception:
+            pass
+        if val is not None:
+            # scale: assume val in [0..1], map to canvas width
+            w = int(min(1.0, val / 0.1) * 220)  # 0.1 RMS maps to full
+            meter_canvas.coords(meter_bar, 0, 0, w, 20)
+            meter_text.config(text=f"{val:.3f}")
+        # schedule next poll
+        meter_after_id['id'] = root.after(60, update_meter)
+
+    # when device selection changes, restart meter
+    def on_device_change(*args):
+        sel = dev_var.get()
+        if sel == 'default':
+            start_meter_for_device(None)
+        else:
+            try:
+                idx = int(sel.split(':')[0])
+            except Exception:
+                idx = None
+            start_meter_for_device(idx)
+
+    dev_var.trace_add('write', on_device_change)
+    # start meter for default selection
+    on_device_change()
 
 
     # Blocksize
@@ -110,6 +226,11 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
         result['secondary_color'] = getattr(btn_secondary, '_rgb', result['secondary_color'])
         result['bg_color'] = getattr(btn_bg, '_rgb', result['bg_color'])
         result['glitch_enabled'] = bool(glitch_var.get())
+        # stop meter stream before closing
+        try:
+            stop_meter()
+        except Exception:
+            pass
         root.destroy()
 
     tk.Button(root, text="Valider", command=valider, bg='#2ecc40', fg='white', height=2, width=20).pack(pady=18)
