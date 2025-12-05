@@ -44,10 +44,14 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
         'glitch_enabled': True,
     }
 
-    # Périphérique
-    tk.Label(root, text="Périphérique d'entrée audio :").pack(anchor='w', padx=10, pady=(18,0))
+    # Périphérique (affiche par défaut les périphériques de sortie)
+    tk.Label(root, text="Périphérique de sortie audio :").pack(anchor='w', padx=10, pady=(18,0))
     dev_var = tk.StringVar(value='default')
-    dev_names = [f"{i}: {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']})" for i, d in enumerate(devices)]
+    # devices may be a filtered list; use the original PortAudio index if present
+    dev_names = []
+    for i, d in enumerate(devices):
+        pa_idx = d.get('_pa_index', i)
+        dev_names.append(f"{pa_idx}: {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']})")
     dev_menu = tk.OptionMenu(root, dev_var, 'default', *dev_names)
     dev_menu.pack(anchor='w', padx=10)
     
@@ -65,6 +69,7 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
     meter_q = queue.Queue()
     meter_stream = {'obj': None}
     meter_after_id = {'id': None}
+    meter_sim = {'thread': None, 'running': False}
 
     def audio_callback(indata, frames, time_info, status):
         # compute RMS of first channel, push to queue
@@ -104,9 +109,42 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
             stream.start()
             meter_stream['obj'] = stream
             meter_text.config(text='0.00')
-        except Exception as e:
+        except Exception:
             meter_text.config(text='err')
             meter_stream['obj'] = None
+
+    def start_simulator():
+        # simple simulator to feed the meter when sounddevice is not available
+        if meter_sim['running']:
+            return
+        meter_sim['running'] = True
+
+        def run_sim():
+            import random
+            while meter_sim['running']:
+                # produce a varying RMS-like value
+                v = random.random() * 0.12
+                try:
+                    while not meter_q.empty():
+                        meter_q.get_nowait()
+                    meter_q.put_nowait(v)
+                except Exception:
+                    pass
+                time.sleep(0.06)
+
+        t = threading.Thread(target=run_sim, daemon=True)
+        meter_sim['thread'] = t
+        t.start()
+
+    def stop_simulator():
+        meter_sim['running'] = False
+        t = meter_sim.get('thread')
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=0.1)
+            except Exception:
+                pass
+        meter_sim['thread'] = None
 
     def stop_meter():
         s = meter_stream.get('obj')
@@ -128,10 +166,10 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
 
     def update_meter():
         # poll queue for latest rms
+        val = None
         try:
-                val = None
-                while True:
-                    val = meter_q.get_nowait()
+            while True:
+                val = meter_q.get_nowait()
         except Exception:
             pass
         if val is not None:
@@ -146,17 +184,35 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
     def on_device_change(*args):
         sel = dev_var.get()
         if sel == 'default':
-            start_meter_for_device(None)
+            # default -> let system choose (no specific device)
+            stop_meter()
+            meter_text.config(text='—')
+            return
+        try:
+            pa_idx = int(sel.split(':')[0])
+        except Exception:
+            pa_idx = None
+        # find the selected device entry in the provided devices list
+        sel_dev = None
+        for d in devices:
+            if d.get('_pa_index', None) == pa_idx:
+                sel_dev = d
+                break
+        # if the selected output device also exposes input channels (monitor/loopback), start meter
+        if sel_dev is not None and sel_dev.get('max_input_channels', 0) > 0:
+            start_meter_for_device(pa_idx)
         else:
-            try:
-                idx = int(sel.split(':')[0])
-            except Exception:
-                idx = None
-            start_meter_for_device(idx)
+            stop_meter()
+            meter_text.config(text='no capture')
 
     dev_var.trace_add('write', on_device_change)
     # start meter for default selection
     on_device_change()
+    # start simulator if no sounddevice available (allows visual testing)
+    if sd is None:
+        start_simulator()
+    # start the periodic meter update loop
+    update_meter()
 
 
     # Blocksize

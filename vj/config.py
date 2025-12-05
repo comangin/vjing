@@ -30,20 +30,40 @@ class Config:
         self.glitch_enabled = glitch_enabled
 
 
-def list_devices() -> List[Dict]:
-    """Retourne la liste des périphériques audio (ou lève si sd non dispo).
+def list_devices(outputs_only: bool = True) -> List[Dict]:
+    """Retourne la liste des périphériques audio.
 
-    Chaque entrée est un dict tel que renvoyé par `sounddevice.query_devices()`.
+    Par défaut (outputs_only=True) on renvoie les périphériques qui fournissent
+    des canaux de sortie (max_output_channels > 0) afin de permettre la
+    sélection des périphériques de lecture. Passez outputs_only=False pour
+    obtenir la liste complète.
     """
     if sd is None:
         raise RuntimeError(f"sounddevice non disponible: {_sd_import_err}")
-    return sd.query_devices()
+    devs = sd.query_devices()
+    if not outputs_only:
+        # annotate with their PortAudio index for callers that expect it
+        for i, d in enumerate(devs):
+            d['_pa_index'] = i
+        return devs
+    out = []
+    for i, d in enumerate(devs):
+        if d.get('max_output_channels', 0) > 0:
+            # keep the original PortAudio index so UI can map back
+            d['_pa_index'] = i
+            out.append(d)
+    return out
 
 
-def format_devices() -> List[str]:
-    """Helper: liste des noms + indices formatés pour affichage."""
-    devs = list_devices()
+def format_devices(outputs_only: bool = True) -> List[str]:
+    """Helper: liste des noms + indices formatés pour affichage.
+
+    Par défaut, n'affiche que les périphériques de sortie. Passer
+    `outputs_only=False` pour lister tous les périphériques.
+    """
+    devs = list_devices(outputs_only=outputs_only)
     lines = []
     for i, d in enumerate(devs):
-        lines.append(f"{i}: {d['name']}  in={d['max_input_channels']} out={d['max_output_channels']}")
+        pa_idx = d.get('_pa_index', i)
+        lines.append(f"{pa_idx}: {d['name']}  in={d['max_input_channels']} out={d['max_output_channels']}")
     return lines
