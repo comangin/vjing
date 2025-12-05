@@ -265,9 +265,48 @@ def select_config(devices, default_blocksize=1024, default_samplerate=None):
         else:
             try:
                 idx = int(dev.split(':')[0])
-                result['device'] = idx
             except Exception:
-                result['device'] = None
+                idx = None
+            # Map selected output device to an input capture device when possible.
+            # If the selected output exposes input channels (monitor), use it.
+            # Otherwise try to find a "monitor" device matching the output name.
+            chosen_idx = idx
+            try:
+                if idx is not None:
+                    # find selected device entry from provided list
+                    sel_dev = None
+                    for d in devices:
+                        if d.get('_pa_index', None) == idx:
+                            sel_dev = d
+                            break
+                    # if selected output has input channels, use it
+                    if sel_dev is not None and sel_dev.get('max_input_channels', 0) > 0:
+                        chosen_idx = idx
+                    else:
+                        # try to find monitor/input device by name
+                        if sd is not None:
+                            all_devs = sd.query_devices()
+                            name_lower = (sel_dev.get('name','') if sel_dev else '').lower()
+                            monitor_idx = None
+                            # heuristics: look for devices that contain 'monitor' and the output name
+                            for j, dd in enumerate(all_devs):
+                                nm = (dd.get('name') or '').lower()
+                                if 'monitor' in nm and (name_lower in nm or name_lower.split()[0] in nm):
+                                    monitor_idx = j
+                                    break
+                            # fallback: any device that is an input and whose name contains the output name
+                            if monitor_idx is None:
+                                for j, dd in enumerate(all_devs):
+                                    nm = (dd.get('name') or '').lower()
+                                    if dd.get('max_input_channels', 0) > 0 and name_lower in nm:
+                                        monitor_idx = j
+                                        break
+                            if monitor_idx is not None:
+                                chosen_idx = monitor_idx
+            except Exception:
+                # best-effort mapping: if anything fails, keep chosen_idx as idx
+                chosen_idx = idx
+            result['device'] = chosen_idx
         try:
             result['blocksize'] = int(block_var.get())
         except Exception:
